@@ -1,0 +1,151 @@
+#include "u_log.h"
+
+/* ----------------------- 配置 ----------------------- */
+
+static char        log_buf[LOG_BUF_SIZE + 1];
+static int         LOG_INITED = 0;
+static USARTConfig usartc;
+uint16_t           recv_len;
+
+static void LOG_DMA_Init(void);
+static void log_process(char* line);
+
+extern TaskHandle_t xLogTaskHandle;
+
+/* ----------------------- 初始化 ----------------------- */
+void log_init(void)
+{
+	usart_default_config(&usartc);
+	u_usart_init(&usartc);
+	LOG_INITED = 1;
+
+	LOG_DMA_Init();
+	/* 启用 USART IDLE 中断 */
+	USART_ITConfig(usartc.usartx, USART_IT_IDLE, ENABLE);
+
+	NVIC_SetPriority(usartc.IRQn, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY);
+	//    NVIC_SetPriority(usartc.IRQn, 6);
+	NVIC_EnableIRQ(usartc.IRQn);
+}
+
+static void LOG_DMA_Init(void)
+{
+	RCC_AHB1PeriphClockCmd(usartc.dma_rx_rcc, ENABLE);
+	// #define SERIAL_USART      USART2
+    // DMA_DeInit(usartc.dma_rx_stream);
+	DMA_InitTypeDef dma_init;
+	DMA_StructInit(&dma_init);                                        // Important 
+	dma_init.DMA_Channel            = usartc.dma_rx_channel;
+	dma_init.DMA_DIR                = DMA_DIR_PeripheralToMemory;
+	dma_init.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+	dma_init.DMA_MemoryInc          = DMA_MemoryInc_Enable;
+	dma_init.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+	dma_init.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
+	dma_init.DMA_Mode               = DMA_Mode_Normal;             // Important 
+	dma_init.DMA_Priority           = DMA_Priority_High;
+	dma_init.DMA_PeripheralBaseAddr = (uint32_t)&usartc.usartx->DR;
+	dma_init.DMA_Memory0BaseAddr    = (uint32_t)log_buf;
+	dma_init.DMA_BufferSize         = LOG_BUF_SIZE;
+
+	DMA_Init(usartc.dma_rx_stream, &dma_init);
+	USART_DMACmd(usartc.usartx, USART_DMAReq_Rx, ENABLE);
+	DMA_Cmd(usartc.dma_rx_stream, ENABLE);
+}
+
+/* ----------------------- 串口 DMA + IDLE 中断 ----------------------- */
+void USART2_IRQHandler(void)
+{
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+	if (USART_GetITStatus(usartc.usartx, USART_IT_IDLE) ==SET)
+	{
+
+		(void)usartc.usartx->SR;
+		(void)usartc.usartx->DR;
+
+		recv_len = LOG_BUF_SIZE - DMA_GetCurrDataCounter(usartc.dma_rx_stream);
+
+		if (recv_len > 0 && recv_len <= LOG_BUF_SIZE)
+		{
+			// 通知日志任务处理（携带长度信息）
+			vTaskNotifyGiveFromISR(xLogTaskHandle, &xHigherPriorityTaskWoken);
+		}
+	}
+
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+/* ----------------------- Log 接收任务 ----------------------- */
+void vTaskRun_LogRx(void* pvParameters)
+{
+	(void)pvParameters;
+
+	while (1)
+	{
+		// 阻塞等待中断通知
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        DMA_Cmd(usartc.dma_rx_stream, DISABLE);
+        while (usartc.dma_rx_stream->CR & DMA_SxCR_EN);
+
+		// 确保末尾 '\0'
+		if (recv_len > 0 && recv_len < LOG_BUF_SIZE)
+			log_buf[recv_len + 1] = '\0';
+		else
+			log_buf[LOG_BUF_SIZE] = '\0';
+
+		log_process(log_buf);
+		recv_len = 0;
+		// /* 清 DMA 标志位（非常关键） */
+		DMA_ClearFlag(usartc.dma_rx_stream,
+					DMA_FLAG_TCIF5 |
+					DMA_FLAG_HTIF5 |
+					DMA_FLAG_TEIF5 |
+					DMA_FLAG_DMEIF5 |
+					DMA_FLAG_FEIF5);
+		// /* 重新配置 DMA */
+		// usartc.dma_rx_stream->PAR  = (uint32_t)&usartc.usartx->DR;
+		usartc.dma_rx_stream->M0AR = (uint32_t)log_buf;
+		usartc.dma_rx_stream->NDTR = LOG_BUF_SIZE;
+
+		DMA_Cmd(usartc.dma_rx_stream, ENABLE);
+	}
+}
+
+static void log_process(char* line)
+{
+	if (!line || line[0] == '\0') return;
+
+	char ssid_buf[128]     = { 0 };
+	char password_buf[128] = { 0 };
+	
+	if (sscanf(line, "WIFI: \"%127[^\"]\" \"%127[^\"]\"", ssid_buf, password_buf) != 2)
+	{
+
+		log("WIFI Info Error. Received SSID='%s', PASSWORD='%s'.", ssid_buf, password_buf);
+		log("Correct format: WIFI: \"SSID\" \"PASSWORD\". Example: WIFI: \"MyWiFi\" \"12345678\"");
+	}
+	else
+	{
+		// 拷贝到全局变量
+		strncpy(ssid, ssid_buf, sizeof(ssid) - 1);
+		ssid[sizeof(ssid) - 1] = '\0';
+		strncpy(password, password_buf, sizeof(password) - 1);
+		password[sizeof(password) - 1] = '\0';
+
+		log("WIFI Info Changed. SSID='%s', PASSWORD='%s'", ssid, password);
+		xEventGroupSetBits(g_sys_event, EVT_WIFI_NEED_CONNECT);
+	}
+}
+
+/* ----------------------- printf 重定向 ----------------------- */
+PUTCHAR_PROTOTYPE
+{
+	if (!LOG_INITED) return ch;  // 丢弃，不阻塞、不死机
+
+	while (USART_GetFlagStatus(LOG_USART, USART_FLAG_TXE) == RESET);
+	USART_SendData(LOG_USART, (uint8_t)ch);
+	while (USART_GetFlagStatus(LOG_USART, USART_FLAG_TC) == RESET);
+	return ch;
+}
+
